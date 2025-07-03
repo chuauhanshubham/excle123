@@ -1,0 +1,551 @@
+muje us me require('dotenv').config();
+const express = require('express');
+const multer = require('multer');
+const XLSX = require('xlsx');
+const fs = require('fs-extra');
+const path = require('path');
+const cors = require('cors');
+const mongoose = require('mongoose');
+
+// Models
+const UploadedFile = require('./models/UploadedFile');
+const Report = require('./models/Report');
+
+const app = express();
+const PORT = process.env.PORT || 5000;
+
+// Ensure directories exist
+const uploadDir = path.join(__dirname, 'uploads');
+const outputDir = path.join(__dirname, 'output');
+fs.ensureDirSync(uploadDir);
+fs.ensureDirSync(outputDir);
+
+// Middleware
+app.use(cors({
+  origin: process.env.CLIENT_ORIGIN,
+  methods: ['GET', 'POST'],
+  allowedHeaders: ['Content-Type']
+}));
+app.use(express.json());
+app.use('/output', express.static(outputDir));
+
+// MongoDB connection
+mongoose.connect(process.env.MONGODB_URI, {
+  useNewUrlParser: true,
+  useUnifiedTopology: true
+}).then(() => console.log('✅ Connected to MongoDB'))
+  .catch(err => console.error('❌ MongoDB connection error:', err));
+
+// In-memory cache
+let globalDataMap = { "1": [], "2": [] };
+
+// Multer setup
+const storage = multer.diskStorage({
+  destination: uploadDir,
+  filename: (req, file, cb) => {
+    const panelId = req.query.type === 'Withdrawal' ? '2' : '1';
+    cb(null, `panel-${panelId}-input.xlsx`);
+  }
+});
+const fileFilter = (req, file, cb) => {
+  const allowed = [
+    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    'application/vnd.ms-excel'
+  ];
+  cb(null, allowed.includes(file.mimetype));
+};
+const upload = multer({ storage, fileFilter });
+
+// Date parser
+function extractDateOnly(value) {
+  if (!value) return '';
+  if (typeof value === 'number') {
+    const excelEpoch = new Date(Date.UTC(1899, 11, 30));
+    return new Date(excelEpoch.getTime() + (value - 1) * 86400000).toISOString().slice(0, 10);
+  }
+  if (typeof value === 'string' && /^\d{2}-\d{2}-\d{4}/.test(value)) {
+    const [d, m, y] = value.split(' ')[0].split('-');
+    return new Date(`${y}-${m}-${d}`).toISOString().slice(0, 10);
+  }
+  return new Date(value).toISOString().slice(0, 10);
+}
+
+// Upload endpoint
+app.post('/api/upload', upload.single('file'), async (req, res) => {
+  try {
+    const panelId = req.query.type === 'Withdrawal' ? '2' : '1';
+    if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+
+    const workbook = XLSX.readFile(req.file.path);
+    const sheet = workbook.Sheets[workbook.SheetNames[0]];
+    const rawData = XLSX.utils.sheet_to_json(sheet);
+
+    if (!rawData.length) return res.status(400).json({ error: 'Excel file is empty' });
+
+    const processedData = rawData.map(row => {
+      const dateVal = row['Date'] || row['Transaction Date'] || row['Created At'];
+      return { ...row, DateOnly: extractDateOnly(dateVal) };
+    });
+
+    const merchants = [...new Set(processedData.map(r => r['Merchant Name']).filter(Boolean))];
+    globalDataMap[panelId] = processedData;
+
+    await UploadedFile.create({
+      panelId,
+      originalName: req.file.originalname,
+      filePath: req.file.path,
+      merchants,
+      data: processedData
+    });
+
+    res.json({ success: true, merchants });
+  } catch (err) {
+    res.status(500).json({ error: err.message || 'Upload failed' });
+  }
+});
+
+// Generate report
+app.post('/api/generate', async (req, res) => {
+  try {
+    const { merchantPercents, startDate, endDate } = req.body;
+    const panelId = req.query.type === 'Withdrawal' ? '2' : '1';
+    const data = globalDataMap[panelId];
+
+    if (!data.length) return res.status(400).json({ error: 'No data available' });
+
+    const normalizedStart = new Date(startDate).toISOString().slice(0, 10);
+    const normalizedEnd = new Date(endDate).toISOString().slice(0, 10);
+
+    const filteredData = [];
+    const summaryData = [];
+    let grandW = 0, grandF = 0, grandP = 0;
+
+    for (const merchant in merchantPercents) {
+      const percent = parseFloat(merchantPercents[merchant]);
+      if (isNaN(percent)) continue;
+
+      const rows = data.filter(row =>
+        row.DateOnly >= normalizedStart &&
+        row.DateOnly <= normalizedEnd &&
+        row['Merchant Name'] === merchant
+      );
+
+      if (!rows.length) continue;
+
+      let totalW = 0, totalF = 0, totalP = 0;
+
+      rows.forEach(row => {
+        const withdrawal = parseFloat(row['Withdrawal Amount'] || 0);
+        const fee = parseFloat(row['Withdrawal Fees'] || 0);
+        const percentAmount = withdrawal * percent / 100;
+
+        totalW += withdrawal;
+        totalF += fee;
+        totalP += percentAmount;
+
+        filteredData.push({
+          Merchant: merchant,
+          'Withdrawal Amount': withdrawal,
+          'Withdrawal Fees': fee,
+          [`${percent}% Amount`]: percentAmount.toFixed(2)
+        });
+      });
+
+      filteredData.push({
+        Merchant: `Total of ${merchant}`,
+        'Withdrawal Amount': totalW.toFixed(2),
+        'Withdrawal Fees': totalF.toFixed(2),
+        [`${percent}% Amount`]: totalP.toFixed(2)
+      });
+
+      grandW += totalW;
+      grandF += totalF;
+      grandP += totalP;
+
+      summaryData.push({
+        Merchant: merchant,
+        'Total Withdrawal Amount': totalW.toFixed(2),
+        'Total Withdrawal Fees': totalF.toFixed(2),
+        [`${percent}% Amount`]: totalP.toFixed(2)
+      });
+    }
+
+    filteredData.push({
+      Merchant: 'GRAND TOTAL',
+      'Withdrawal Amount': grandW.toFixed(2),
+      'Withdrawal Fees': grandF.toFixed(2),
+      [`TOTAL % Amount`]: grandP.toFixed(2)
+    });
+
+    summaryData.push({
+      Merchant: 'TOTAL',
+      'Total Withdrawal Amount': grandW.toFixed(2),
+      'Total Withdrawal Fees': grandF.toFixed(2),
+      [`TOTAL % Amount`]: grandP.toFixed(2)
+    });
+
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(filteredData), 'Detailed Data');
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(summaryData), 'Summary');
+
+    const filename = `report-panel-${panelId}-${Date.now()}.xlsx`;
+    const filepath = path.join(outputDir, filename);
+    XLSX.writeFile(wb, filepath);
+
+    const downloadUrl = `/output/${filename}`;
+
+    await Report.create({
+      panelId,
+      startDate: normalizedStart,
+      endDate: normalizedEnd,
+      merchantPercents,
+      summary: summaryData,
+      downloadUrl
+    });
+
+    res.json({
+      success: true,
+      summary: summaryData,
+      downloadUrl
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message || 'Failed to generate summary' });
+  }
+});
+
+// Start server
+app.listen(PORT, () => {
+  console.log(`✅ Server running at http://localhost:${PORT}`);
+});
+
+
+
+// src/App.js
+import React, { useState } from 'react';
+import SummaryPanel from './SummaryPanel';
+import './App.css';
+import {
+  BrowserRouter as Router,
+  Routes,
+  Route,
+  Link
+} from 'react-router-dom';
+
+function HomePage({ summaries, setSummaries }) {
+  const handleSummaryUpdate = (panelType, summary) => {
+    setSummaries((prev) => ({
+      ...prev,
+      [panelType]: summary,
+    }));
+  };
+
+  return (
+    <div className="app-container">
+      <header className="app-header">
+        <h1>Excel Summary Generator</h1>
+        <nav>
+          <Link to="/combined" className="nav-link">
+            View Combined Summary
+          </Link>
+        </nav>
+      </header>
+
+      <div className="panels-container">
+        <SummaryPanel panelType="Deposite" onSummaryUpdate={handleSummaryUpdate} />
+        <SummaryPanel panelType="Withdrawal" onSummaryUpdate={handleSummaryUpdate} />
+      </div>
+    </div>
+  );
+}
+
+function CombinedSummaryPage({ summaries }) {
+  const combined = [...(summaries['Deposite'] || []), ...(summaries['Withdrawal'] || [])];
+
+  return (
+    <div className="app-container">
+      <header className="app-header">
+        <h1>Combined Merchant Summary</h1>
+        <nav>
+          <Link to="/" className="nav-link">
+            Back to Panels
+          </Link>
+        </nav>
+      </header>
+
+      <div className="combined-summary-container">
+        {combined.length > 0 ? (
+          <div className="table-container">
+            <table>
+              <thead>
+                <tr>
+                  {Object.keys(combined[0] || {}).map((k, i) => (
+                    <th key={i}>{k}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {combined.map((row, i) => (
+                  <tr key={i}>
+                    {Object.values(row).map((val, j) => (
+                      <td key={j}>{val}</td>
+                    ))}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        ) : (
+          <div className="no-data-message">
+            No summary data available. Please generate summaries in both panels first.
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function App() {
+  const [summaries, setSummaries] = useState({});
+
+  return (
+    <Router>
+      <Routes>
+        <Route
+          path="/"
+          element={<HomePage summaries={summaries} setSummaries={setSummaries} />}
+        />
+        <Route
+          path="/combined"
+          element={<CombinedSummaryPage summaries={summaries} />}
+        />
+      </Routes>
+    </Router>
+  );
+}
+
+export default App;
+import React, { useState } from 'react';
+import axios from 'axios';
+
+const API_BASE_URL = process.env.REACT_APP_API_BASE_URL;
+
+function SummaryPanel({ panelType, onSummaryUpdate }) {
+  const [file, setFile] = useState(null);
+  const [merchants, setMerchants] = useState([]);
+  const [selectedMerchants, setSelectedMerchants] = useState([]);
+  const [merchantPercents, setMerchantPercents] = useState({});
+  const [defaultPercent, setDefaultPercent] = useState(3.6);
+  const [startDate, setStartDate] = useState('');
+  const [endDate, setEndDate] = useState('');
+  const [summary, setSummary] = useState(null);
+  const [downloadUrl, setDownloadUrl] = useState(null);
+  const [loading, setLoading] = useState(false);
+
+  const handleUpload = async () => {
+    if (!file) return alert('Please select a file.');
+
+    const formData = new FormData();
+    formData.append('file', file);
+    setLoading(true);
+
+    try {
+      // ✅ FIXED: Changed `/upload` to `/api/upload`
+      const res = await axios.post(
+        `${API_BASE_URL}/api/upload?type=${panelType}`,
+        formData,
+        {
+          headers: {
+            'Content-Type': 'multipart/form-data',
+          },
+        }
+      );
+
+      setMerchants(res.data.merchants || []);
+      setSelectedMerchants([]);
+      setMerchantPercents({});
+      setSummary(null);
+      setDownloadUrl(null);
+
+      alert(`✅ ${panelType} - File uploaded successfully`);
+    } catch (err) {
+      const errorMsg = err.response?.data?.error || err.message;
+      alert(`❌ ${panelType} - Upload failed: ${errorMsg}`);
+    }
+
+    setLoading(false);
+  };
+
+  const handleGenerate = async () => {
+    if (selectedMerchants.length === 0 || !startDate || !endDate) {
+      return alert('Please fill in all filters.');
+    }
+
+    const selectedPercents = {};
+    selectedMerchants.forEach((m) => {
+      selectedPercents[m] = parseFloat(merchantPercents[m] || defaultPercent);
+    });
+
+    setLoading(true);
+
+    try {
+      // ✅ FIXED: Changed `/generate` to `/api/generate`
+      const res = await axios.post(`${API_BASE_URL}/api/generate?type=${panelType}`, {
+        merchantPercents: selectedPercents,
+        startDate,
+        endDate,
+      });
+
+      setSummary(res.data.summary);
+      setDownloadUrl(`${API_BASE_URL}${res.data.downloadUrl}`);
+      onSummaryUpdate(panelType, res.data.summary);
+    } catch (err) {
+      alert(`❌ ${panelType} - Error generating summary: ${err.message}`);
+    }
+
+    setLoading(false);
+  };
+
+  const handleSelectAll = () => {
+    const allMerchants = [...merchants];
+    const defaultPercents = {};
+    allMerchants.forEach((m) => {
+      defaultPercents[m] = merchantPercents[m] || defaultPercent;
+    });
+    setSelectedMerchants(allMerchants);
+    setMerchantPercents(defaultPercents);
+  };
+
+  return (
+    <div className="panel-container">
+      <h2>Excel {panelType}</h2>
+
+      <div className="section">
+        <h3>Choose File</h3>
+        <div className="file-upload-section">
+          <input
+            id={`file-upload-${panelType}`}
+            type="file"
+            accept=".xls,.xlsx"
+            onChange={(e) => setFile(e.target.files[0])}
+            style={{ display: 'none' }}
+          />
+          <label htmlFor={`file-upload-${panelType}`} className="custom-file-upload">
+            📁 Choose File
+          </label>
+          {file && <span className="file-name">{file.name}</span>}
+        </div>
+        <button
+          onClick={handleUpload}
+          disabled={!file || loading}
+          className={`upload-btn ${loading ? 'loading' : ''}`}
+        >
+          {loading ? 'Uploading...' : '⬆️ Upload File'}
+        </button>
+      </div>
+
+      <div className="section">
+        <h3>Filter Options</h3>
+        <div className="date-inputs">
+          <div className="date-input-group">
+            <label>Start Date:</label>
+            <input
+              type="date"
+              value={startDate}
+              onChange={(e) => setStartDate(e.target.value)}
+            />
+          </div>
+          <div className="date-input-group">
+            <label>End Date:</label>
+            <input
+              type="date"
+              value={endDate}
+              onChange={(e) => setEndDate(e.target.value)}
+            />
+          </div>
+        </div>
+      </div>
+
+      <div className="section">
+        <h3>Select Merchants & %</h3>
+        <div className="merchant-controls">
+          <button onClick={handleSelectAll} className="select-all-btn">
+            Select All
+          </button>
+          <div className="default-percent">
+            <label>Default %: </label>
+            <input
+              type="number"
+              step="0.1"
+              min="0"
+              max="100"
+              value={defaultPercent}
+              onChange={(e) => setDefaultPercent(parseFloat(e.target.value))}
+            />
+          </div>
+        </div>
+
+        <div className="merchant-list">
+          {merchants.map((merchant, i) => (
+            <div key={i} className="merchant-item">
+              <input
+                type="checkbox"
+                checked={selectedMerchants.includes(merchant)}
+                onChange={(e) => {
+                  if (e.target.checked) {
+                    setSelectedMerchants([...selectedMerchants, merchant]);
+                    setMerchantPercents((prev) => ({
+                      ...prev,
+                      [merchant]: prev[merchant] || defaultPercent,
+                    }));
+                  } else {
+                    setSelectedMerchants(selectedMerchants.filter((m) => m !== merchant));
+                    const newPercents = { ...merchantPercents };
+                    delete newPercents[merchant];
+                    setMerchantPercents(newPercents);
+                  }
+                }}
+              />
+              <label className="merchant-name">{merchant}</label>
+              <input
+                type="number"
+                placeholder="%"
+                step="0.1"
+                min="0"
+                max="100"
+                disabled={!selectedMerchants.includes(merchant)}
+                value={merchantPercents[merchant] || ''}
+                onChange={(e) =>
+                  setMerchantPercents({
+                    ...merchantPercents,
+                    [merchant]: e.target.value,
+                  })
+                }
+              />
+            </div>
+          ))}
+        </div>
+      </div>
+
+      <button
+        onClick={handleGenerate}
+        disabled={loading || selectedMerchants.length === 0 || !startDate || !endDate}
+        className={`generate-btn ${loading ? 'loading' : ''}`}
+      >
+        {loading ? 'Generating...' : '📈 Generate Summary'}
+      </button>
+
+      {downloadUrl && (
+        <div className="download-btn">
+          <a href={downloadUrl} target="_blank" rel="noopener noreferrer">
+            ⬇️ Download Excel
+          </a>
+        </div>
+      )}
+    </div>
+  );
+}
+
+export default SummaryPanel;
+
+
+es tare ek ka working kar va na he to tu muje us fule me kay kay chay g kar na ho o sab muje kar ke di
